@@ -1,0 +1,1437 @@
+# meta developer: @your_username
+# meta desc: Автоматическое нажатие кнопок по триггер-словам (10 слотов)
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import unicodedata
+from typing import Optional, Tuple, Dict, Any, List
+
+try:
+    from telethon.tl.custom.message import Message
+    from telethon.errors import ChatAdminRequiredError, ChannelPrivateError, UsernameNotOccupiedError
+except ImportError:
+    from hikkatl.tl.custom.message import Message
+    from hikkatl.errors import ChatAdminRequiredError, ChannelPrivateError, UsernameNotOccupiedError
+
+from .. import loader, utils
+
+logger = logging.getLogger(__name__)
+
+
+def _normalize(text: str) -> str:
+    return " ".join((text or "").lower().split())
+
+
+def _compact(text: str) -> str:
+    return "".join((text or "").lower().split())
+
+
+def _fold_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text or "").lower().replace("ё", "е")
+    chars = []
+    for char in normalized:
+        category = unicodedata.category(char)
+        if category in {"Mn", "Cf"}:
+            continue
+        if char.isalnum():
+            chars.append(char)
+    return "".join(chars)
+
+
+def parse_delay(delay_str: str) -> float:
+    """Парсит задержку из формата '1м 1с', '5с', '2м', '0.5м' и т.д."""
+    if not delay_str:
+        return 0.5
+
+    delay_str = delay_str.strip().lower()
+    total_seconds = 0.0
+
+    patterns = [
+        (r'(\d+(?:\.\d+)?)\s*ч', 3600),
+        (r'(\d+(?:\.\d+)?)\s*час', 3600),
+        (r'(\d+(?:\.\d+)?)\s*м', 60),
+        (r'(\d+(?:\.\d+)?)\s*мин', 60),
+        (r'(\d+(?:\.\d+)?)\s*с', 1),
+        (r'(\d+(?:\.\d+)?)\s*сек', 1),
+    ]
+
+    for pattern, multiplier in patterns:
+        matches = re.findall(pattern, delay_str)
+        for match in matches:
+            total_seconds += float(match) * multiplier
+
+    if total_seconds == 0:
+        try:
+            total_seconds = float(delay_str)
+        except ValueError:
+            total_seconds = 0.5
+
+    return max(0.1, min(total_seconds, 600.0))
+
+
+def format_delay(seconds: float) -> str:
+    """Форматирует задержку в читаемый вид"""
+    seconds = round(seconds, 1)
+    if seconds >= 60:
+        minutes = int(seconds // 60)
+        secs = seconds % 60
+        if secs >= 0.9:
+            return f"{minutes}м {secs:.0f}с"
+        return f"{minutes}м"
+    elif seconds >= 1:
+        return f"{seconds:.0f}с"
+    else:
+        return f"{seconds:.1f}с"
+
+
+def parse_slots(slots_str: str, max_slots: int = 10) -> List[int]:
+    """
+    Парсит строку со слотами в список номеров.
+    Поддерживает форматы:
+    - "1" - один слот
+    - "123" - несколько слотов подряд
+    - "1 2 3" - слоты через пробел
+    - "1,2,3" - слоты через запятую
+    - "1-3" - диапазон слотов
+    - "1-3 5 7-9" - смешанный формат
+    """
+    if not slots_str:
+        return []
+    
+    # Заменяем запятые на пробелы
+    slots_str = slots_str.replace(",", " ")
+    
+    # Ищем диапазоны (например, "1-3")
+    parts = []
+    for part in slots_str.split():
+        if "-" in part:
+            try:
+                start, end = part.split("-", 1)
+                start_num = int(start)
+                end_num = int(end)
+                if start_num <= end_num:
+                    parts.extend(range(start_num, end_num + 1))
+                else:
+                    parts.extend(range(end_num, start_num + 1))
+            except ValueError:
+                continue
+        else:
+            # Проверяем, не является ли это строкой из нескольких цифр подряд (например, "123")
+            if part.isdigit() and len(part) > 1:
+                # Разбиваем на отдельные цифры
+                parts.extend([int(d) for d in part])
+            else:
+                try:
+                    parts.append(int(part))
+                except ValueError:
+                    continue
+    
+    # Фильтруем и сортируем
+    valid_slots = sorted(set([s for s in parts if 1 <= s <= max_slots]))
+    return valid_slots
+
+
+@loader.tds
+class AutoClicker10Mod(loader.Module):
+    """Автоматическое нажатие кнопок по триггер-словам (10 слотов)."""
+
+    strings = {
+        "name": "Автокнопка10",
+        "no_reply": "<b>❌ Сделай реплай на сообщение с кнопкой!</b>",
+        "usage": (
+            "<b>📋 Формат:</b>\n"
+            "<code>.к 1 текст сообщения | текст кнопки [| количество]</code>\n"
+            "Пример: <code>.к 1 +50 | +50 | 3</code> (нажмёт 3 раза)\n"
+            "Выключить: <code>.к 1 выкл</code>\n\n"
+            "<b>⌨️ Другие команды:</b>\n"
+            "<code>.кстоп 1</code> - поставить слот на паузу\n"
+            "<code>.кстоп 123</code> - поставить слоты 1,2,3 на паузу\n"
+            "<code>.кстоп 1-5</code> - поставить слоты 1-5 на паузу\n"
+            "<code>.кстарт 1</code> - снять слот с паузы\n"
+            "<code>.кч 1</code> - установить чат для слота\n"
+            "<code>.кзадержкас 1 5с</code> - установить задержку\n"
+            "<code>.ктест</code> - тест кнопки в реплае\n"
+            "<code>.кстат</code> - статус всех слотов\n"
+            "<code>.квыкл</code> - выключить всё\n"
+            "<code>.квыклн 1</code> - выключить слот"
+        ),
+        "enabled": (
+            "<b>✅ Автокнопка #{slot} включена.</b>\n"
+            "🎯 Триггер: <code>{trigger}</code>\n"
+            "🔘 Кнопка: <code>{button}</code>\n"
+            "🔁 Количество нажатий: <code>{clicks}</code>\n"
+            "⏱ Задержка: <code>{delay}</code>"
+        ),
+        "disabled": "<b>❌ Автокнопка #{slot} выключена.</b>",
+        "slot_paused": "<b>⏸ Слоты поставлены на паузу:</b> {slots}",
+        "slot_resumed": "<b>▶️ Слоты сняты с паузы:</b> {slots}",
+        "slot_already_paused": "<b>ℹ️ Слоты уже на паузе:</b> {slots}",
+        "slot_already_active": "<b>ℹ️ Слоты уже активны:</b> {slots}",
+        "slot_not_configured": "<b>⚠️ Слот #{slot} не настроен. Сначала настройте его: .к {slot} триггер | кнопка</b>",
+        "no_valid_slots": "<b>❌ Не указаны корректные номера слотов (1-10).</b>",
+        "clicked_log": (
+            "🔘 Нажал кнопку #{slot} ({click_num}/{total_clicks})\n"
+            "🎯 Триггер: {trigger}\n"
+            "🔘 Кнопка: {button}\n"
+            "📌 Чат: {chat_id}\n"
+            "📝 Сообщение: {message_link}"
+        ),
+        "clicked_all_log": (
+            "✅ Автокнопка #{slot} выполнила все {total_clicks} нажатий\n"
+            "🎯 Триггер: {trigger}\n"
+            "🔘 Кнопка: {button}\n"
+            "📌 Чат: {chat_id}\n"
+            "📝 Сообщение: {message_link}"
+        ),
+        "chat_set": "<b>📌 Чат автокнопки #{slot} сохранён:</b> <code>{chat_id}</code>",
+        "chat_set_current": "<b>📌 Чат автокнопки #{slot} сохранён:</b> <code>текущий чат</code> (<code>{chat_id}</code>)",
+        "chat_reset": "<b>📌 Чат автокнопки #{slot} выключен.</b>",
+        "log_chat_set": "<b>📝 Чат для логов сохранён:</b> <code>{chat_id}</code>",
+        "log_chat_set_current": "<b>📝 Чат для логов сохранён:</b> <code>текущий чат</code> (<code>{chat_id}</code>)",
+        "log_chat_reset": "<b>📝 Чат для логов выключен. Логи будут только в консоль.</b>",
+        "test_usage": (
+            "<b>🧪 Сделай реплай на сообщение с кнопкой:</b>\n"
+            "<code>.ктест текст кнопки [| количество]</code>\n"
+            "Пример: <code>.ктест +50 | 3</code> (нажмёт 3 раза)\n"
+            "Или <code>.ктест *</code>, чтобы нажать первую кнопку один раз."
+        ),
+        "test_result": (
+            "<b>🧪 Тест кнопки:</b> <code>{status}</code>\n"
+            "Нажато: <code>{clicked_count}/{total_clicks}</code>\n"
+            "Кнопка: <code>{button}</code>\n"
+            "Видимые кнопки: <code>{buttons}</code>\n"
+            "Отладка: <code>{debug}</code>"
+        ),
+        "list_result": "<b>📋 Видимые кнопки:</b> <code>{buttons}</code>",
+        "status_header": "<b>📊 Статус автокнопок ({active}/{total} активных слотов)</b>\n\n",
+        "status_slot": (
+            "<b>🔘 Слот #{slot}</b> {status}\n"
+            "  🎯 Триггер: {trigger}\n"
+            "  🔘 Кнопка: {button}\n"
+            "  🔁 Нажатий: {clicks}\n"
+            "  ⏱ Задержка: {delay}\n"
+            "  📌 Чат: {chat}\n\n"
+        ),
+        "status_footer": (
+            "<b>📝 Логи:</b> {log_status}\n"
+            "<b>📝 Последний клик:</b> {last_click}\n"
+            "<b>🔍 Последние кнопки:</b> <code>{last_buttons}</code>\n"
+            "<b>⚠️ Отладка:</b> <code>{last_error}</code>"
+        ),
+        "all_disabled": "<b>❌ Все автокнопки выключены.</b>",
+        "bad_entity": "<b>❌ Не удалось найти чат.</b>\n\n💡 Попробуй:\n• Перешли сообщение из чата в @userinfobot\n• Используй команду .id в чате\n• Затем: <code>.кч 1 ID_чата</code>",
+        "default_delay": 0.5,
+        "slot_range": "1-10",
+        "slot_out_of_range": "<b>❌ Слот должен быть от 1 до 10.</b>",
+        "no_slot_number": "<b>❌ Укажи номер слота: .кстоп 3 или .кстоп 1-5</b>",
+        "invalid_slot_number": "<b>❌ Введи номер слота (1-10).</b>",
+        "no_args": "<b>❌ Укажи номер слота и настройки: .к <номер> триггер | кнопка [| N]</b>",
+        "how_to_get_chat_id": (
+            "<b>📖 Как получить ID чата:</b>\n"
+            "1️⃣ Перешли сообщение из нужного чата в @userinfobot\n"
+            "2️⃣ Или отправь в чате команду <code>.id</code>\n"
+            "3️⃣ Используй полученный ID: <code>.кч 1 -1001234567890</code>"
+        ),
+        "delay_current": "<b>⏱ Текущая задержка для слота #{slot}:</b> <code>{delay}</code>",
+        "delay_set": "<b>✅ Задержка для слота #{slot} установлена:</b> <code>{delay}</code>",
+        "delay_error": "<b>❌ Неверный формат. Примеры: .кзадержкас 3 1м, .кзадержкас 3 5с, .кзадержкас 3 1м30с</b>",
+        "slot_disabled": "<b>❌ Слот #{slot} выключен.</b>",
+        "delay_usage": (
+            "<b>📋 Установка задержки для слота (макс. 10 минут):</b>\n"
+            "<code>.кзадержкас номер_слота задержка</code>\n"
+            "Примеры:\n"
+            "  <code>.кзадержкас 3 1м</code> - 1 минута\n"
+            "  <code>.кзадержкас 3 5с</code> - 5 секунд\n"
+            "  <code>.кзадержкас 3 1м30с</code> - 1 минута 30 секунд\n"
+            "  <code>.кзадержкас 3 0.5</code> - 0.5 секунды"
+        ),
+        "config_loaded": "<b>✅ Конфигурация загружена для слота #{slot}.</b>\n🎯 Триггер: <code>{trigger}</code>\n🔘 Кнопка: <code>{button}</code>\n🔁 Нажатий: <code>{clicks}</code>\n⏱ Задержка: <code>{delay}</code>",
+        "slot_active": "✅ <b>Активен</b>",
+        "slot_paused_status": "⏸ <b>На паузе</b>",
+        "slot_not_configured_status": "❌ <b>Не настроен</b>",
+    }
+
+    def __init__(self) -> None:
+        self.config = loader.ModuleConfig(
+            loader.ConfigValue(
+                "default_delay",
+                0.5,
+                "Задержка между кликами по умолчанию (секунды)",
+                validator=loader.validators.Float(minimum=0.1, maximum=600.0),
+            ),
+            loader.ConfigValue(
+                "max_clicks",
+                20,
+                "Максимальное количество нажатий за раз",
+                validator=loader.validators.Integer(minimum=1, maximum=100),
+            ),
+            loader.ConfigValue(
+                "log_to_console",
+                True,
+                "Дублировать логи в консоль",
+                validator=loader.validators.Boolean(),
+            ),
+            # Настройки для слота 1
+            loader.ConfigValue(
+                "slot1_trigger",
+                "",
+                "🎯 Слот 1: Триггер-слово",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "slot1_button",
+                "",
+                "🔘 Слот 1: Текст кнопки",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "slot1_clicks",
+                1,
+                "🔁 Слот 1: Количество нажатий",
+                validator=loader.validators.Integer(minimum=1, maximum=100),
+            ),
+            loader.ConfigValue(
+                "slot1_delay",
+                0.5,
+                "⏱ Слот 1: Задержка между кликами (секунды)",
+                validator=loader.validators.Float(minimum=0.1, maximum=600.0),
+            ),
+            # Настройки для слота 2
+            loader.ConfigValue(
+                "slot2_trigger",
+                "",
+                "🎯 Слот 2: Триггер-слово",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "slot2_button",
+                "",
+                "🔘 Слот 2: Текст кнопки",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "slot2_clicks",
+                1,
+                "🔁 Слот 2: Количество нажатий",
+                validator=loader.validators.Integer(minimum=1, maximum=100),
+            ),
+            loader.ConfigValue(
+                "slot2_delay",
+                0.5,
+                "⏱ Слот 2: Задержка между кликами (секунды)",
+                validator=loader.validators.Float(minimum=0.1, maximum=600.0),
+            ),
+            # Настройки для слота 3
+            loader.ConfigValue(
+                "slot3_trigger",
+                "",
+                "🎯 Слот 3: Триггер-слово",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "slot3_button",
+                "",
+                "🔘 Слот 3: Текст кнопки",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "slot3_clicks",
+                1,
+                "🔁 Слот 3: Количество нажатий",
+                validator=loader.validators.Integer(minimum=1, maximum=100),
+            ),
+            loader.ConfigValue(
+                "slot3_delay",
+                0.5,
+                "⏱ Слот 3: Задержка между кликами (секунды)",
+                validator=loader.validators.Float(minimum=0.1, maximum=600.0),
+            ),
+            # Настройки для слота 4
+            loader.ConfigValue(
+                "slot4_trigger",
+                "",
+                "🎯 Слот 4: Триггер-слово",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "slot4_button",
+                "",
+                "🔘 Слот 4: Текст кнопки",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "slot4_clicks",
+                1,
+                "🔁 Слот 4: Количество нажатий",
+                validator=loader.validators.Integer(minimum=1, maximum=100),
+            ),
+            loader.ConfigValue(
+                "slot4_delay",
+                0.5,
+                "⏱ Слот 4: Задержка между кликами (секунды)",
+                validator=loader.validators.Float(minimum=0.1, maximum=600.0),
+            ),
+            # Настройки для слота 5
+            loader.ConfigValue(
+                "slot5_trigger",
+                "",
+                "🎯 Слот 5: Триггер-слово",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "slot5_button",
+                "",
+                "🔘 Слот 5: Текст кнопки",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "slot5_clicks",
+                1,
+                "🔁 Слот 5: Количество нажатий",
+                validator=loader.validators.Integer(minimum=1, maximum=100),
+            ),
+            loader.ConfigValue(
+                "slot5_delay",
+                0.5,
+                "⏱ Слот 5: Задержка между кликами (секунды)",
+                validator=loader.validators.Float(minimum=0.1, maximum=600.0),
+            ),
+            # Настройки для слота 6
+            loader.ConfigValue(
+                "slot6_trigger",
+                "",
+                "🎯 Слот 6: Триггер-слово",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "slot6_button",
+                "",
+                "🔘 Слот 6: Текст кнопки",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "slot6_clicks",
+                1,
+                "🔁 Слот 6: Количество нажатий",
+                validator=loader.validators.Integer(minimum=1, maximum=100),
+            ),
+            loader.ConfigValue(
+                "slot6_delay",
+                0.5,
+                "⏱ Слот 6: Задержка между кликами (секунды)",
+                validator=loader.validators.Float(minimum=0.1, maximum=600.0),
+            ),
+            # Настройки для слота 7
+            loader.ConfigValue(
+                "slot7_trigger",
+                "",
+                "🎯 Слот 7: Триггер-слово",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "slot7_button",
+                "",
+                "🔘 Слот 7: Текст кнопки",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "slot7_clicks",
+                1,
+                "🔁 Слот 7: Количество нажатий",
+                validator=loader.validators.Integer(minimum=1, maximum=100),
+            ),
+            loader.ConfigValue(
+                "slot7_delay",
+                0.5,
+                "⏱ Слот 7: Задержка между кликами (секунды)",
+                validator=loader.validators.Float(minimum=0.1, maximum=600.0),
+            ),
+            # Настройки для слота 8
+            loader.ConfigValue(
+                "slot8_trigger",
+                "",
+                "🎯 Слот 8: Триггер-слово",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "slot8_button",
+                "",
+                "🔘 Слот 8: Текст кнопки",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "slot8_clicks",
+                1,
+                "🔁 Слот 8: Количество нажатий",
+                validator=loader.validators.Integer(minimum=1, maximum=100),
+            ),
+            loader.ConfigValue(
+                "slot8_delay",
+                0.5,
+                "⏱ Слот 8: Задержка между кликами (секунды)",
+                validator=loader.validators.Float(minimum=0.1, maximum=600.0),
+            ),
+            # Настройки для слота 9
+            loader.ConfigValue(
+                "slot9_trigger",
+                "",
+                "🎯 Слот 9: Триггер-слово",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "slot9_button",
+                "",
+                "🔘 Слот 9: Текст кнопки",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "slot9_clicks",
+                1,
+                "🔁 Слот 9: Количество нажатий",
+                validator=loader.validators.Integer(minimum=1, maximum=100),
+            ),
+            loader.ConfigValue(
+                "slot9_delay",
+                0.5,
+                "⏱ Слот 9: Задержка между кликами (секунды)",
+                validator=loader.validators.Float(minimum=0.1, maximum=600.0),
+            ),
+            # Настройки для слота 10
+            loader.ConfigValue(
+                "slot10_trigger",
+                "",
+                "🎯 Слот 10: Триггер-слово",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "slot10_button",
+                "",
+                "🔘 Слот 10: Текст кнопки",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "slot10_clicks",
+                1,
+                "🔁 Слот 10: Количество нажатий",
+                validator=loader.validators.Integer(minimum=1, maximum=100),
+            ),
+            loader.ConfigValue(
+                "slot10_delay",
+                0.5,
+                "⏱ Слот 10: Задержка между кликами (секунды)",
+                validator=loader.validators.Float(minimum=0.1, maximum=600.0),
+            ),
+        )
+        self._client: Optional[Any] = None
+        self._db: Optional[Any] = None
+        self._max_slots: int = 10
+        self._state: Dict[str, Any] = self._default_state()
+
+    def _default_state(self) -> Dict[str, Any]:
+        state: Dict[str, Any] = {
+            "last_clicked_at": 0.0,
+            "last_buttons": "-",
+            "last_error": "-",
+            "log_chat_id": None,
+        }
+        for slot in range(1, self._max_slots + 1):
+            state[f"button{slot}_trigger"] = None
+            state[f"button{slot}_target"] = None
+            state[f"button{slot}_clicks"] = 1
+            state[f"button{slot}_delay"] = self.config["default_delay"]
+            state[f"button{slot}_last_msg"] = 0
+            state[f"button{slot}_chat"] = None
+            state[f"button{slot}_paused"] = False
+        return state
+
+    async def client_ready(self, client: Any, db: Any) -> None:
+        self._client = client
+        self._db = db
+        saved_state = self.get("state", {}) or {}
+        default_state = self._default_state()
+        for key, value in default_state.items():
+            if key not in saved_state:
+                saved_state[key] = value
+        self._state = {**default_state, **saved_state}
+        
+        # Загружаем настройки из конфига
+        self._load_config_slots()
+        self._save_state()
+
+    def _load_config_slots(self) -> None:
+        """Загружает настройки слотов из конфига модуля"""
+        for slot in range(1, self._max_slots + 1):
+            trigger_key = f"slot{slot}_trigger"
+            button_key = f"slot{slot}_button"
+            clicks_key = f"slot{slot}_clicks"
+            delay_key = f"slot{slot}_delay"
+            
+            config_trigger = self.config.get(trigger_key, "").strip()
+            config_button = self.config.get(button_key, "").strip()
+            config_clicks = self.config.get(clicks_key, 1)
+            config_delay = self.config.get(delay_key, 0.5)
+            
+            if config_trigger and config_button:
+                self._set_rule(
+                    slot,
+                    trigger=config_trigger,
+                    button=config_button,
+                    clicks=config_clicks,
+                    delay=config_delay,
+                    last_msg=0,
+                )
+                logger.info(f"Слот #{slot} загружен из конфига: {config_trigger} -> {config_button}")
+
+    def _save_state(self) -> None:
+        if self._db:
+            self.set("state", self._state)
+
+    @staticmethod
+    def _now() -> float:
+        import time
+        return time.time()
+
+    @staticmethod
+    def _text(message: Message) -> str:
+        return getattr(message, "raw_text", None) or getattr(message, "message", "") or ""
+
+    def _contains_any(self, text: str, markers: Tuple[str, ...]) -> bool:
+        if not text:
+            return False
+        normalized = _normalize(text)
+        compact = _compact(text)
+        folded = _fold_text(text)
+        for marker in markers:
+            if not marker:
+                continue
+            marker_normalized = _normalize(marker)
+            marker_compact = _compact(marker)
+            marker_folded = _fold_text(marker)
+            if marker_normalized and marker_normalized in normalized:
+                return True
+            if marker_compact and marker_compact in compact:
+                return True
+            if marker_folded and marker_folded in folded:
+                return True
+        return False
+
+    @staticmethod
+    def _button_rows(buttons: Any) -> List[List[Any]]:
+        rows: List[List[Any]] = []
+        if not buttons:
+            return rows
+        for row in buttons:
+            row_buttons = getattr(row, "buttons", None)
+            if row_buttons is not None:
+                rows.append(list(row_buttons))
+            elif isinstance(row, (list, tuple)):
+                rows.append(list(row))
+            else:
+                rows.append([row])
+        return rows
+
+    @staticmethod
+    def _button_label(button: Any) -> str:
+        return str(getattr(button, "text", "") or button).strip()
+
+    def _button_matches(self, expected: str, label: str) -> bool:
+        expected = (expected or "").strip()
+        if not expected:
+            return False
+        if expected in {"*", "первая", "first", "1"}:
+            return True
+        expected_normalized = _normalize(expected)
+        label_normalized = _normalize(label or "")
+        if expected_normalized and expected_normalized in label_normalized:
+            return True
+        expected_folded = _fold_text(expected)
+        label_folded = _fold_text(label or "")
+        return bool(expected_folded and expected_folded in label_folded)
+
+    def _field_names(self, slot: int) -> Tuple[str, str, str, str, str, str, str]:
+        return (
+            f"button{slot}_trigger",
+            f"button{slot}_target",
+            f"button{slot}_clicks",
+            f"button{slot}_delay",
+            f"button{slot}_last_msg",
+            f"button{slot}_chat",
+            f"button{slot}_paused",
+        )
+
+    def _get_rule(self, slot: int) -> Tuple[Optional[str], Optional[str], int, float, int, Optional[int], bool]:
+        trigger_key, target_key, clicks_key, delay_key, last_key, chat_key, paused_key = self._field_names(slot)
+        return (
+            self._state.get(trigger_key),
+            self._state.get(target_key),
+            int(self._state.get(clicks_key) or 1),
+            float(self._state.get(delay_key) or self.config["default_delay"]),
+            int(self._state.get(last_key) or 0),
+            self._state.get(chat_key),
+            bool(self._state.get(paused_key, False)),
+        )
+
+    def _set_rule(
+        self,
+        slot: int,
+        *,
+        trigger: Optional[str] = None,
+        button: Optional[str] = None,
+        clicks: Optional[int] = None,
+        delay: Optional[float] = None,
+        last_msg: Optional[int] = None,
+        chat_id: Optional[int] = None,
+        paused: Optional[bool] = None,
+    ) -> None:
+        trigger_key, target_key, clicks_key, delay_key, last_key, chat_key, paused_key = self._field_names(slot)
+        if trigger is not None:
+            self._state[trigger_key] = trigger
+        if button is not None:
+            self._state[target_key] = button
+        if clicks is not None:
+            self._state[clicks_key] = max(1, min(clicks, self.config["max_clicks"]))
+        if delay is not None:
+            self._state[delay_key] = max(0.1, min(delay, 600.0))
+        if last_msg is not None:
+            self._state[last_key] = int(last_msg)
+        if chat_id is not None:
+            self._state[chat_key] = int(chat_id) if chat_id else None
+        if paused is not None:
+            self._state[paused_key] = bool(paused)
+        self._save_state()
+
+    def _has_any_rule(self) -> bool:
+        for slot in range(1, self._max_slots + 1):
+            trigger, button, _, _, _, _, paused = self._get_rule(slot)
+            if trigger and button and not paused:
+                return True
+        return False
+
+    def _count_active_rules(self) -> int:
+        count = 0
+        for slot in range(1, self._max_slots + 1):
+            trigger, button, _, _, _, _, paused = self._get_rule(slot)
+            if trigger and button and not paused:
+                count += 1
+        return count
+
+    async def _send_log(self, text: str) -> None:
+        log_chat_id = self._state.get("log_chat_id")
+        if log_chat_id and self._client:
+            try:
+                await self._client.send_message(log_chat_id, text)
+            except Exception as e:
+                logger.error("Failed to send log to chat %s: %s", log_chat_id, e)
+                if self.config["log_to_console"]:
+                    logger.info(text)
+        elif self.config["log_to_console"]:
+            logger.info(text)
+
+    async def _get_message_link(self, message: Message) -> str:
+        try:
+            chat_id = message.chat_id
+            message_id = message.id
+            if chat_id and self._client:
+                try:
+                    entity = await self._client.get_entity(chat_id)
+                    username = getattr(entity, "username", None)
+                    if username:
+                        return f"https://t.me/{username}/{message_id}"
+                except Exception:
+                    pass
+                chat_id_str = str(chat_id)
+                if chat_id_str.startswith("-100"):
+                    return f"https://t.me/c/{chat_id_str[4:]}/{message_id}"
+                else:
+                    return f"https://t.me/c/{chat_id_str}/{message_id}"
+        except Exception:
+            pass
+        return f"ID сообщения: {getattr(message, 'id', 0)}"
+
+    async def _read_button_rows(self, message: Message) -> List[List[Any]]:
+        buttons = getattr(message, "buttons", None)
+        if not buttons:
+            try:
+                buttons = await message.get_buttons()
+            except Exception as e:
+                logger.debug("get_buttons failed: %s", e)
+                buttons = None
+        rows = self._button_rows(buttons)
+        labels = [self._button_label(button) for row in rows for button in row]
+        self._state["last_buttons"] = ", ".join(labels) if labels else "-"
+        self._save_state()
+        return rows
+
+    async def _click_button(
+        self,
+        message: Message,
+        button_text: str,
+        *,
+        slot: Optional[int] = None,
+        clicks_count: int = 1,
+        delay_between: float = 0.5,
+    ) -> Tuple[int, str]:
+        try:
+            rows = await self._read_button_rows(message)
+        except Exception as e:
+            self._state["last_error"] = f"не смог прочитать кнопки: {type(e).__name__}"
+            self._save_state()
+            logger.exception("Failed to fetch buttons for message %s", getattr(message, "id", 0))
+            return 0, "-"
+
+        if not rows:
+            self._state["last_error"] = "в сообщении нет кнопок"
+            self._save_state()
+            return 0, "-"
+
+        target_coords = None
+        target_label = None
+
+        for row_index, row in enumerate(rows):
+            for button_index, button in enumerate(row):
+                label = self._button_label(button)
+                if self._button_matches(button_text, label):
+                    target_coords = (row_index, button_index)
+                    target_label = label
+                    break
+            if target_coords:
+                break
+
+        if not target_coords:
+            flat_buttons = [
+                (row_index, button_index, button)
+                for row_index, row in enumerate(rows)
+                for button_index, button in enumerate(row)
+            ]
+            if len(flat_buttons) == 1:
+                row_index, button_index, button = flat_buttons[0]
+                target_coords = (row_index, button_index)
+                target_label = self._button_label(button)
+
+        if not target_coords:
+            self._state["last_error"] = "подходящая кнопка не найдена"
+            self._save_state()
+            return 0, "-"
+
+        success_count = 0
+
+        for i in range(clicks_count):
+            try:
+                row_idx, btn_idx = target_coords
+                await message.click(row_idx, btn_idx)
+                success_count += 1
+
+                if slot is not None:
+                    self._set_rule(slot, last_msg=getattr(message, "id", 0) or 0)
+
+                self._state["last_clicked_at"] = self._now()
+                self._state["last_error"] = f"ok: {target_label} ({i+1}/{clicks_count})"
+                self._save_state()
+
+                if i < clicks_count - 1 and delay_between > 0:
+                    await asyncio.sleep(delay_between)
+
+            except Exception as e:
+                self._state["last_error"] = f"ошибка клика {i+1}: {type(e).__name__}: {e}"
+                self._save_state()
+                logger.exception(
+                    "Failed to click button %r (attempt %d/%d) for message %s",
+                    target_label,
+                    i + 1,
+                    clicks_count,
+                    getattr(message, "id", 0),
+                )
+                break
+
+        return success_count, target_label or "-"
+
+    async def _maybe_click_by_rule(self, message: Message, slot: int) -> bool:
+        try:
+            trigger, button, clicks, delay, last_msg, chat_id, paused = self._get_rule(slot)
+            if not trigger or not button or paused:
+                return False
+
+            message_chat = getattr(message, "chat_id", None)
+            if chat_id is not None and message_chat != chat_id:
+                return False
+
+            message_id = int(getattr(message, "id", 0) or 0)
+            if message_id and message_id == last_msg:
+                return False
+
+            text = self._text(message)
+            if not text or not self._contains_any(text, (trigger,)):
+                return False
+
+            clicked_count, label = await self._click_button(
+                message, button, slot=slot, clicks_count=clicks, delay_between=delay
+            )
+
+            if clicked_count > 0:
+                message_link = await self._get_message_link(message)
+                chat_id_str = str(message_chat) if message_chat else "unknown"
+
+                logger.info(
+                    "Clicked button slot %s (%r -> %r) %d/%d times on message %s in chat %s (delay=%s)",
+                    slot, trigger, label, clicked_count, clicks, message_id, chat_id_str, delay
+                )
+
+                if clicked_count == clicks:
+                    log_text = self.strings("clicked_all_log").format(
+                        slot=slot,
+                        total_clicks=clicks,
+                        trigger=utils.escape_html(str(trigger)),
+                        button=utils.escape_html(label),
+                        chat_id=chat_id_str,
+                        message_link=message_link,
+                    )
+                else:
+                    log_text = self.strings("clicked_log").format(
+                        slot=slot,
+                        click_num=clicked_count,
+                        total_clicks=clicks,
+                        trigger=utils.escape_html(str(trigger)),
+                        button=utils.escape_html(label),
+                        chat_id=chat_id_str,
+                        message_link=message_link,
+                    )
+
+                await self._send_log(log_text)
+
+            return clicked_count > 0
+        except Exception as e:
+            logger.exception("Error in _maybe_click_by_rule for slot %s: %s", slot, e)
+            return False
+
+    @loader.watcher("in")
+    async def button_watcher(self, message: Message) -> None:
+        if not self._client or not self._has_any_rule():
+            return
+
+        try:
+            for slot in range(1, self._max_slots + 1):
+                if await self._maybe_click_by_rule(message, slot):
+                    return
+        except Exception as e:
+            logger.exception("Error in button_watcher: %s", e)
+
+    def _parse_args_with_clicks(self, args: str) -> Tuple[str, str, int]:
+        parts = [p.strip() for p in args.split("|")]
+
+        if len(parts) == 1:
+            return parts[0], "", 1
+
+        trigger = parts[0]
+        button = parts[1] if len(parts) > 1 else ""
+        clicks = 1
+
+        if len(parts) >= 3 and parts[2]:
+            try:
+                clicks = int(parts[2])
+                clicks = max(1, min(clicks, self.config["max_clicks"]))
+            except ValueError:
+                clicks = 1
+
+        return trigger, button, clicks
+
+    async def _configure_slot(self, message: Message, slot: int, args: str) -> None:
+        if slot < 1 or slot > self._max_slots:
+            await utils.answer(message, self.strings("slot_out_of_range"))
+            return
+
+        if not args:
+            await utils.answer(message, self.strings("no_args"))
+            return
+
+        if args.lower() in {"выкл", "стоп", "0"}:
+            self._set_rule(slot, trigger=None, button=None, clicks=1, last_msg=0, paused=False)
+            await utils.answer(message, self.strings("disabled").format(slot=slot))
+            return
+
+        trigger, button, clicks = self._parse_args_with_clicks(args)
+
+        if not trigger or not button:
+            await utils.answer(message, self.strings("usage"))
+            return
+
+        _, _, _, current_delay, _, _, _ = self._get_rule(slot)
+
+        self._set_rule(slot, trigger=trigger, button=button, clicks=clicks, delay=current_delay, last_msg=0, paused=False)
+
+        await utils.answer(
+            message,
+            self.strings("enabled").format(
+                slot=slot,
+                trigger=utils.escape_html(trigger),
+                button=utils.escape_html(button),
+                clicks=clicks,
+                delay=format_delay(current_delay),
+            ),
+        )
+
+    async def _set_slot_delay(self, message: Message) -> None:
+        args = utils.get_args_raw(message).strip()
+
+        if not args:
+            await utils.answer(message, self.strings("delay_usage"))
+            return
+
+        parts = args.split(maxsplit=1)
+        if len(parts) != 2:
+            await utils.answer(message, self.strings("delay_usage"))
+            return
+
+        try:
+            slot = int(parts[0])
+        except ValueError:
+            await utils.answer(message, self.strings("invalid_slot_number"))
+            return
+
+        if slot < 1 or slot > self._max_slots:
+            await utils.answer(message, self.strings("slot_out_of_range"))
+            return
+
+        delay_str = parts[1]
+        delay_seconds = parse_delay(delay_str)
+
+        self._set_rule(slot, delay=delay_seconds)
+
+        trigger, button, clicks, _, _, _, _ = self._get_rule(slot)
+        delay_formatted = format_delay(delay_seconds)
+
+        if trigger and button:
+            await utils.answer(
+                message,
+                f"<b>✅ Задержка для слота #{slot} установлена:</b> <code>{delay_formatted}</code>\n"
+                f"🎯 Триггер: <code>{utils.escape_html(trigger)}</code>\n"
+                f"🔘 Кнопка: <code>{utils.escape_html(button)}</code>"
+            )
+        else:
+            await utils.answer(
+                message,
+                self.strings("delay_set").format(slot=slot, delay=delay_formatted)
+            )
+
+    async def _resolve_chat_id(self, input_str: str) -> Optional[int]:
+        if not input_str:
+            return None
+
+        if input_str.lstrip("-").isdigit():
+            return int(input_str)
+
+        try:
+            entity = await self._client.get_entity(input_str)
+            return int(utils.get_entity_id(entity))
+        except (UsernameNotOccupiedError, ValueError, ChatAdminRequiredError, ChannelPrivateError):
+            return None
+        except Exception:
+            return None
+
+    async def _configure_chat(self, message: Message, slot: int, args: str) -> None:
+        if slot < 1 or slot > self._max_slots:
+            await utils.answer(message, self.strings("slot_out_of_range"))
+            return
+
+        if args.lower() in {"выкл", "сброс", "0"}:
+            self._set_rule(slot, chat_id=None)
+            await utils.answer(message, self.strings("chat_reset").format(slot=slot))
+            return
+
+        if not args:
+            chat_id = getattr(message, "chat_id", None)
+            if not chat_id:
+                await utils.answer(message, self.strings("bad_entity"))
+                return
+
+            self._set_rule(slot, chat_id=chat_id)
+            await utils.answer(
+                message,
+                self.strings("chat_set_current").format(slot=slot, chat_id=chat_id),
+            )
+            return
+
+        chat_id = await self._resolve_chat_id(args)
+
+        if not chat_id:
+            await utils.answer(message, self.strings("bad_entity"))
+            return
+
+        self._set_rule(slot, chat_id=chat_id)
+        await utils.answer(
+            message,
+            self.strings("chat_set").format(slot=slot, chat_id=chat_id),
+        )
+
+    async def _configure_log_chat(self, message: Message, args: str) -> None:
+        if args.lower() in {"выкл", "сброс", "0"}:
+            self._state["log_chat_id"] = None
+            self._save_state()
+            await utils.answer(message, self.strings("log_chat_reset"))
+            return
+
+        if not args:
+            chat_id = getattr(message, "chat_id", None)
+            if not chat_id:
+                await utils.answer(message, self.strings("bad_entity"))
+                return
+
+            self._state["log_chat_id"] = chat_id
+            self._save_state()
+            await utils.answer(
+                message,
+                self.strings("log_chat_set_current").format(chat_id=chat_id),
+            )
+            return
+
+        chat_id = await self._resolve_chat_id(args)
+
+        if not chat_id:
+            await utils.answer(message, self.strings("bad_entity"))
+            return
+
+        self._state["log_chat_id"] = chat_id
+        self._save_state()
+        await utils.answer(
+            message,
+            self.strings("log_chat_set").format(chat_id=chat_id),
+        )
+
+    # ==================== КОМАНДЫ ====================
+
+    @loader.command(ru_doc="<номер слота> [текст] | [кнопка] [| N] - создать правило для слота")
+    async def к(self, message: Message) -> None:
+        """Универсальная команда для настройки слота: .к <номер> триггер | кнопка [| количество]"""
+        args = utils.get_args_raw(message).strip()
+        
+        if not args:
+            await utils.answer(message, self.strings("usage"))
+            return
+        
+        parts = args.split(maxsplit=1)
+        
+        try:
+            slot = int(parts[0])
+        except ValueError:
+            await utils.answer(message, self.strings("invalid_slot_number"))
+            return
+        
+        slot_args = parts[1] if len(parts) > 1 else ""
+        await self._configure_slot(message, slot, slot_args)
+
+    @loader.command(ru_doc="<номера слотов> - поставить слоты на паузу (например: 1, 123, 1-5, 1 3 5)")
+    async def кстоп(self, message: Message) -> None:
+        """Ставит слоты на паузу: .кстоп 1 или .кстоп 123 или .кстоп 1-5 или .кстоп 1 3 5-7"""
+        args = utils.get_args_raw(message).strip()
+        
+        if not args:
+            await utils.answer(message, self.strings("no_slot_number"))
+            return
+        
+        slots = parse_slots(args, self._max_slots)
+        
+        if not slots:
+            await utils.answer(message, self.strings("no_valid_slots"))
+            return
+        
+        # Разделяем на уже на паузе и те, которые нужно поставить на паузу
+        already_paused = []
+        newly_paused = []
+        
+        for slot in slots:
+            trigger, button, _, _, _, _, paused = self._get_rule(slot)
+            if not trigger or not button:
+                continue  # Пропускаем не настроенные
+            if paused:
+                already_paused.append(slot)
+            else:
+                self._set_rule(slot, paused=True)
+                newly_paused.append(slot)
+        
+        # Формируем ответ
+        messages = []
+        if newly_paused:
+            messages.append(self.strings("slot_paused").format(
+                slots=", ".join(str(s) for s in newly_paused)
+            ))
+        if already_paused:
+            messages.append(self.strings("slot_already_paused").format(
+                slots=", ".join(str(s) for s in already_paused)
+            ))
+        
+        if not messages:
+            messages.append(self.strings("no_valid_slots"))
+        
+        await utils.answer(message, "\n".join(messages))
+
+    @loader.command(ru_doc="<номера слотов> - снять слоты с паузы (например: 1, 123, 1-5, 1 3 5)")
+    async def кстарт(self, message: Message) -> None:
+        """Снимает слоты с паузы: .кстарт 1 или .кстарт 123 или .кстарт 1-5 или .кстарт 1 3 5-7"""
+        args = utils.get_args_raw(message).strip()
+        
+        if not args:
+            await utils.answer(message, self.strings("no_slot_number"))
+            return
+        
+        slots = parse_slots(args, self._max_slots)
+        
+        if not slots:
+            await utils.answer(message, self.strings("no_valid_slots"))
+            return
+        
+        # Разделяем на уже активные и те, которые нужно снять с паузы
+        already_active = []
+        newly_resumed = []
+        
+        for slot in slots:
+            trigger, button, _, _, _, _, paused = self._get_rule(slot)
+            if not trigger or not button:
+                continue  # Пропускаем не настроенные
+            if paused:
+                self._set_rule(slot, paused=False)
+                newly_resumed.append(slot)
+            else:
+                already_active.append(slot)
+        
+        # Формируем ответ
+        messages = []
+        if newly_resumed:
+            messages.append(self.strings("slot_resumed").format(
+                slots=", ".join(str(s) for s in newly_resumed)
+            ))
+        if already_active:
+            messages.append(self.strings("slot_already_active").format(
+                slots=", ".join(str(s) for s in already_active)
+            ))
+        
+        if not messages:
+            messages.append(self.strings("no_valid_slots"))
+        
+        await utils.answer(message, "\n".join(messages))
+
+    @loader.command(ru_doc="<номер слота> [чат/юзернейм/выкл] - установить чат для слота")
+    async def кч(self, message: Message) -> None:
+        """Установка чата для слота: .кч <номер> [ID чата или выкл]"""
+        args = utils.get_args_raw(message).strip()
+        
+        if not args:
+            await utils.answer(message, self.strings("slot_out_of_range"))
+            return
+        
+        parts = args.split(maxsplit=1)
+        
+        try:
+            slot = int(parts[0])
+        except ValueError:
+            await utils.answer(message, self.strings("invalid_slot_number"))
+            return
+        
+        chat_args = parts[1] if len(parts) > 1 else ""
+        await self._configure_chat(message, slot, chat_args)
+
+    @loader.command(ru_doc="[чат/юзернейм/выкл] - установить чат для отправки логов")
+    async def клог(self, message: Message) -> None:
+        """Установка чата для логов: .клог [ID чата или выкл]"""
+        args = utils.get_args_raw(message).strip()
+        await self._configure_log_chat(message, args)
+
+    @loader.command(ru_doc="<номер слота> <задержка> - установить задержку для слота (макс. 10м)")
+    async def кзадержкас(self, message: Message) -> None:
+        await self._set_slot_delay(message)
+
+    @loader.command(ru_doc="[текст кнопки] [| N] - нажать кнопку в сообщении-реплае (тест)")
+    async def ктест(self, message: Message) -> None:
+        reply = await message.get_reply_message()
+        if not reply:
+            await utils.answer(message, self.strings("test_usage"))
+            return
+
+        args = utils.get_args_raw(message).strip()
+        if not args:
+            button_text = "*"
+            clicks = 1
+        else:
+            button_text, _, clicks_str = args.partition("|")
+            button_text = button_text.strip() or "*"
+            clicks = 1
+            if clicks_str.strip():
+                try:
+                    clicks = int(clicks_str.strip())
+                    clicks = max(1, min(clicks, self.config["max_clicks"]))
+                except ValueError:
+                    clicks = 1
+
+        clicked_count, label = await self._click_button(reply, button_text, clicks_count=clicks, delay_between=self.config["default_delay"])
+        await utils.answer(
+            message,
+            self.strings("test_result").format(
+                status="✅ успешно" if clicked_count > 0 else "❌ не нажал",
+                clicked_count=clicked_count,
+                total_clicks=clicks,
+                button=utils.escape_html(label),
+                buttons=utils.escape_html(self._state.get("last_buttons", "-")),
+                debug=utils.escape_html(self._state.get("last_error", "-")),
+            ),
+        )
+
+    @loader.command(ru_doc="- показать все кнопки в сообщении-реплае")
+    async def кноп(self, message: Message) -> None:
+        reply = await message.get_reply_message()
+        if not reply:
+            await utils.answer(message, self.strings("no_reply"))
+            return
+
+        try:
+            await self._read_button_rows(reply)
+            self._state["last_error"] = "ok"
+            self._save_state()
+        except Exception as e:
+            self._state["last_buttons"] = "-"
+            self._state["last_error"] = f"не смог прочитать кнопки: {type(e).__name__}"
+            self._save_state()
+
+        await utils.answer(
+            message,
+            self.strings("list_result").format(
+                buttons=utils.escape_html(self._state.get("last_buttons", "-")),
+            ),
+        )
+
+    @loader.command(ru_doc="- выключить все автокнопки")
+    async def квыкл(self, message: Message) -> None:
+        for slot in range(1, self._max_slots + 1):
+            self._set_rule(slot, trigger=None, button=None, clicks=1, last_msg=0, paused=False)
+        await utils.answer(message, self.strings("all_disabled"))
+
+    @loader.command(ru_doc="<номер слота> - выключить конкретный слот")
+    async def квыклн(self, message: Message) -> None:
+        args = utils.get_args_raw(message).strip()
+        if not args:
+            await utils.answer(message, self.strings("no_slot_number"))
+            return
+
+        try:
+            slot = int(args)
+        except ValueError:
+            await utils.answer(message, self.strings("invalid_slot_number"))
+            return
+
+        if slot < 1 or slot > self._max_slots:
+            await utils.answer(message, self.strings("slot_out_of_range"))
+            return
+
+        self._set_rule(slot, trigger=None, button=None, clicks=1, last_msg=0, paused=False)
+        await utils.answer(message, self.strings("slot_disabled").format(slot=slot))
+
+    @loader.command(ru_doc="- показать статус всех автокнопок")
+    async def кстат(self, message: Message) -> None:
+        # Время последнего клика
+        last_click = self._state.get("last_clicked_at", 0.0)
+        if last_click:
+            seconds_ago = int(self._now() - last_click)
+            if seconds_ago < 60:
+                last_click_str = f"✅ <code>{seconds_ago}с назад</code>"
+            elif seconds_ago < 3600:
+                last_click_str = f"✅ <code>{seconds_ago // 60}м назад</code>"
+            else:
+                last_click_str = f"✅ <code>{seconds_ago // 3600}ч назад</code>"
+        else:
+            last_click_str = "❌ <code>никогда</code>"
+
+        active_count = self._count_active_rules()
+        
+        # Формируем статус
+        result = self.strings("status_header").format(active=active_count, total=self._max_slots)
+
+        # Показываем информацию о каждом слоте
+        for slot in range(1, self._max_slots + 1):
+            trigger, button, clicks, delay, _, chat, paused = self._get_rule(slot)
+
+            # Определяем статус слота
+            if trigger and button:
+                if paused:
+                    slot_status = self.strings("slot_paused_status")
+                else:
+                    slot_status = self.strings("slot_active")
+                
+                trigger_str = f"✅ <code>{utils.escape_html(trigger)}</code>"
+                button_str = f"✅ <code>{utils.escape_html(button)}</code>"
+                clicks_str = f"✅ <code>{clicks}</code>"
+                delay_str = f"✅ <code>{format_delay(delay)}</code>"
+                
+                # Показываем источник настройки
+                config_trigger = self.config.get(f"slot{slot}_trigger", "").strip()
+                if config_trigger == trigger:
+                    source = " 📋конфиг"
+                else:
+                    source = " 💬команда"
+            else:
+                slot_status = self.strings("slot_not_configured_status")
+                trigger_str = "❌ <code>-</code>"
+                button_str = "❌ <code>-</code>"
+                clicks_str = "❌ <code>-</code>"
+                delay_str = "❌ <code>-</code>"
+                source = ""
+
+            chat_str = f"✅ <code>{chat}</code>" if chat else "❌ <code>везде</code>"
+
+            result += self.strings("status_slot").format(
+                slot=slot,
+                status=slot_status,
+                trigger=trigger_str + source,
+                button=button_str,
+                clicks=clicks_str,
+                delay=delay_str,
+                chat=chat_str,
+            )
+
+        log_chat_id = self._state.get("log_chat_id")
+        if log_chat_id:
+            log_status = f"✅ <code>{log_chat_id}</code>"
+        else:
+            log_status = "❌ <code>только консоль</code>"
+
+        result += self.strings("status_footer").format(
+            log_status=log_status,
+            last_click=last_click_str,
+            last_buttons=utils.escape_html(self._state.get("last_buttons", "-")),
+            last_error=utils.escape_html(self._state.get("last_error", "-")),
+        )
+
+        await utils.answer(message, result)
+
+    @loader.command(ru_doc="- показать как получить ID чата")
+    async def какид(self, message: Message) -> None:
+        await utils.answer(message, self.strings("how_to_get_chat_id"))
+
+    @loader.command(ru_doc="- перезагрузить настройки из конфига")
+    async def кконфиг(self, message: Message) -> None:
+        """Перезагружает настройки слотов из конфига модуля"""
+        self._load_config_slots()
+        
+        # Формируем отчёт о загруженных слотах
+        loaded_slots = []
+        for slot in range(1, self._max_slots + 1):
+            config_trigger = self.config.get(f"slot{slot}_trigger", "").strip()
+            config_button = self.config.get(f"slot{slot}_button", "").strip()
+            
+            if config_trigger and config_button:
+                config_clicks = self.config.get(f"slot{slot}_clicks", 1)
+                config_delay = self.config.get(f"slot{slot}_delay", 0.5)
+                loaded_slots.append(
+                    f"<b>Слот #{slot}:</b> ✅ {utils.escape_html(config_trigger)} → "
+                    f"{utils.escape_html(config_button)} ({config_clicks} раз, {format_delay(config_delay)})"
+                )
+            else:
+                loaded_slots.append(
+                    f"<b>Слот #{slot}:</b> ❌ Не настроен"
+                )
+        
+        if loaded_slots:
+            result = "<b>✅ Конфигурация загружена:</b>\n\n" + "\n".join(loaded_slots)
+        else:
+            result = "<b>⚠️ В конфиге нет активных слотов.</b>"
+        
+        await utils.answer(message, result)
